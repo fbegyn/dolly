@@ -1,4 +1,4 @@
-module github.com/o11ydev/d
+module github.com/fbegyn/dolly
 
 go 1.18
 

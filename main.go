@@ -5,9 +5,14 @@ import (
 	_ "embed"
 	"fmt"
 	"html/template"
+	"net/http"
 	"os"
+	"path/filepath"
+	"sort"
+	"strings"
 	"time"
 
+	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/jedib0t/go-pretty/v6/progress"
 	"github.com/o11ydev/oy-toolkit/util/client"
@@ -26,22 +31,52 @@ var (
 		"output.file",
 		"HTML output file",
 	).Default("alerts.html").String()
-)
+	refreshInterval = kingpin.Flag(
+		"refresh.interval",
+		"Regenerate the file and reload the page at this interval (e.g. 30s). 0 generates once",
+	).Default("0s").Duration()
+	mode string
 
-type Alert struct {
-	Name  string
-	State string
-}
+	// "generate" (the default) writes the file; "serve" also hosts it.
+	_             = kingpin.Command("generate", "Generate the HTML file (default).").Default().Action(setMode("generate"))
+	serveCmd      = kingpin.Command("serve", "Regenerate the HTML file periodically and serve it over HTTP.").Action(setMode("serve"))
+	listenAddress = serveCmd.Flag(
+		"web.listen-address",
+		"Address to listen on for the serve command",
+	).Default(":8080").String()
+	hideInactive = kingpin.Flag(
+		"hide.inactive",
+		"Hide hexagons for alerts that are not firing or pending",
+	).Bool()
+	groupByFlag = kingpin.Flag(
+		"group.by",
+		"Comma-separated list of labels to group hexagons by, outermost group first",
+	).Default("job").String()
+)
 
 type Node struct {
 	Job      string
 	Instance string
 }
 
-type result struct {
-	UnattachedAlerts []Alert
-	Nodes            []Node
+// Entity is one hexagon: one alert rule evaluated on one instance.
+type Entity struct {
+	Name   string            `json:"name"`  // instance
+	Alert  string            `json:"alert"` // alert rule name
+	State  string            `json:"state"` // firing, pending or present (metrics exist, alert not active)
+	Labels map[string]string `json:"labels"`
 }
+
+// report is the data handed to the HTML template.
+type report struct {
+	GroupBy  []string `json:"groupBy"`
+	Entities []Entity `json:"entities"`
+	// RefreshSeconds is how often the page reloads itself; 0 disables it.
+	RefreshSeconds int    `json:"refreshSeconds"`
+	Generated      string `json:"generated"`
+}
+
+const defaultServeInterval = 30 * time.Second
 
 func main() {
 	c := client.InitCliFlags()
@@ -53,177 +88,277 @@ func main() {
 		os.Exit(1)
 	}
 
+	if mode == "serve" {
+		if err := serve(logger, promClient); err != nil {
+			level.Error(logger).Log("msg", "Can't serve", "err", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	if *refreshInterval <= 0 {
+		if err := generate(logger, promClient, 0, true); err != nil {
+			level.Error(logger).Log("msg", "Can't generate report", "err", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	// Keep regenerating the file; the page reloads itself at the same interval.
+	for {
+		if err := generate(logger, promClient, *refreshInterval, true); err != nil {
+			level.Error(logger).Log("msg", "Can't generate report", "err", err)
+		}
+		time.Sleep(*refreshInterval)
+	}
+}
+
+// serve regenerates the HTML file periodically and hosts it over HTTP.
+func serve(logger log.Logger, promClient api.Client) error {
+	interval := *refreshInterval
+	if interval <= 0 {
+		interval = defaultServeInterval
+	}
+
+	refresh := func() {
+		if err := generate(logger, promClient, interval, false); err != nil {
+			level.Error(logger).Log("msg", "Can't generate report", "err", err)
+			return
+		}
+		level.Debug(logger).Log("msg", "Report regenerated", "file", *outputFile)
+	}
+	refresh()
+	go func() {
+		for range time.Tick(interval) {
+			refresh()
+		}
+	}()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
+		if _, err := os.Stat(*outputFile); err != nil {
+			http.Error(w, "report not generated yet", http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Cache-Control", "no-store")
+		http.ServeFile(w, r, *outputFile)
+	})
+
+	level.Info(logger).Log("msg", "Serving dashboard", "address", *listenAddress, "file", *outputFile, "interval", interval)
+	return http.ListenAndServe(*listenAddress, mux)
+}
+
+// generate fetches the data and writes the HTML file. When showProgress is
+// false (server mode) no progress bars are drawn.
+func generate(logger log.Logger, promClient api.Client, interval time.Duration, showProgress bool) error {
 	pw := progress.NewWriter()
 	pw.ShowETA(false)
 	pw.ShowValue(false)
 	pw.ShowPercentage(false)
 	pw.ShowTime(false)
-	go pw.Render()
+	if showProgress {
+		go pw.Render()
+	}
 
-	var output result
+	entities, err := fetchData(logger, pw, promClient)
+	if showProgress {
+		pw.Stop()
+		for pw.IsRenderInProgress() {
+			time.Sleep(time.Millisecond * 100)
+		}
+	}
+	if err != nil {
+		return err
+	}
 
-	fetchData(pw, promClient, &output)
-	pw.Stop()
+	if *hideInactive {
+		active := entities[:0]
+		for _, e := range entities {
+			if e.State != "present" {
+				active = append(active, e)
+			}
+		}
+		entities = active
+	}
 
-	for pw.IsRenderInProgress() {
-		time.Sleep(time.Millisecond * 100)
+	var groupBy []string
+	for _, l := range strings.Split(*groupByFlag, ",") {
+		if l = strings.TrimSpace(l); l != "" {
+			groupBy = append(groupBy, l)
+		}
+	}
+
+	return writeReport(*outputFile, report{
+		GroupBy:        groupBy,
+		Entities:       entities,
+		RefreshSeconds: int(interval.Seconds()),
+		Generated:      time.Now().Format(time.RFC1123),
+	})
+}
+
+func setMode(m string) func(*kingpin.ParseContext) error {
+	return func(*kingpin.ParseContext) error {
+		mode = m
+		return nil
 	}
 }
 
-func fetchData(pw progress.Writer, client api.Client, output *result) {
-	t1 := &progress.Tracker{
-		Message: "Fetching instances",
+func nodeOf(l model.LabelSet) Node {
+	return Node{Job: string(l["job"]), Instance: string(l["instance"])}
+}
+
+func labelsOf(sets ...model.LabelSet) map[string]string {
+	m := make(map[string]string)
+	for _, l := range sets {
+		for k, v := range l {
+			m[string(k)] = string(v)
+		}
 	}
-	t2 := &progress.Tracker{
-		Message: "Fetching alerts",
-	}
+	return m
+}
+
+func fetchData(logger log.Logger, pw progress.Writer, client api.Client) ([]Entity, error) {
+	t1 := &progress.Tracker{Message: "Fetching instances"}
+	t2 := &progress.Tracker{Message: "Fetching alerts"}
 	pw.AppendTracker(t1)
 	pw.AppendTracker(t2)
 
 	v1api := v1.NewAPI(client)
 
-	nodes := make(map[Node][]Alert, 0)
-
-	//{
-	//	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	//	defer cancel()
-	//	tgs, err := v1api.Targets(ctx)
-	//	if err != nil {
-	//		fmt.Printf("Error querying Prometheus: %v\n", err)
-	//		t1.MarkAsErrored()
-	//		return
-	//	}
-
-	//	for _, t := range tgs.Active {
-	//		nodes[Node{Job: string(t.Labels["job"]), Instance: string(t.Labels["instance"])}] = make([]Alert, 0)
-	//	}
-
-	//	t1.MarkAsDone()
-
-	//}
-
+	// Target labels per job/instance, so that any of them can be used for grouping.
+	targets := make(map[Node]model.LabelSet)
 	{
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		rules, err := v1api.Rules(ctx)
+		tgs, err := v1api.Targets(ctx)
+		cancel()
 		if err != nil {
-			fmt.Printf("Error querying Prometheus: %v\n", err)
-			t2.MarkAsErrored()
-			return
+			t1.MarkAsErrored()
+			return nil, fmt.Errorf("querying targets: %w", err)
 		}
-		t2.MarkAsDone()
+		for _, t := range tgs.Active {
+			targets[nodeOf(t.Labels)] = t.Labels
+		}
+		t1.MarkAsDone()
+	}
 
-		todo := make([]v1.AlertingRule, 0)
-		for _, g := range rules.Groups {
-			for _, rule := range g.Rules {
-				switch v := rule.(type) {
-				case v1.AlertingRule:
-					todo = append(todo, v)
-				default:
-					continue
-				}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	rules, err := v1api.Rules(ctx)
+	cancel()
+	if err != nil {
+		t2.MarkAsErrored()
+		return nil, fmt.Errorf("querying rules: %w", err)
+	}
+	t2.MarkAsDone()
+
+	var todo []v1.AlertingRule
+	for _, g := range rules.Groups {
+		for _, rule := range g.Rules {
+			if v, ok := rule.(v1.AlertingRule); ok {
+				todo = append(todo, v)
 			}
 		}
-		t3 := &progress.Tracker{
-			Message: "Analyzing alerts",
-			Total:   int64(len(todo)),
+	}
+	t3 := &progress.Tracker{
+		Message: "Analyzing alerts",
+		Total:   int64(len(todo)),
+	}
+	pw.AppendTracker(t3)
+
+	var out []Entity
+	for _, r := range todo {
+		// Nodes on which this rule is pending or firing.
+		active := make(map[Node]bool)
+		for _, a := range r.Alerts {
+			n := nodeOf(a.Labels)
+			active[n] = true
+			l := labelsOf(targets[n], a.Labels)
+			l["alertname"] = r.Name
+			out = append(out, Entity{Name: n.Instance, Alert: r.Name, State: string(a.State), Labels: l})
 		}
-		pw.AppendTracker(t3)
 
-		for _, r := range todo {
-			for _, a := range r.Alerts {
-				if _, ok := nodes[Node{Job: string(a.Labels["job"]), Instance: string(a.Labels["instance"])}]; !ok {
-					nodes[Node{Job: string(a.Labels["job"]), Instance: string(a.Labels["instance"])}] = make([]Alert, 0)
-				}
-				x := nodes[Node{Job: string(a.Labels["job"]), Instance: string(a.Labels["instance"])}]
-				nodes[Node{Job: string(a.Labels["job"]), Instance: string(a.Labels["instance"])}] = append(x, Alert{Name: r.Name, State: string(a.State)})
-			}
-
-			out, err := analyzeMetricsFromQuery(r.Query)
-			if err != nil {
-				fmt.Printf("%s\n", err.Error())
-				t3.IncrementWithError(1)
-				continue
-			}
-			if len(out) == 0 {
-				t3.Increment(1)
-				continue
-			}
-
-			query := ""
-			for i, v := range out {
-				if i > 0 {
-					query = query + " and "
-				}
-				query = query + "group by (instance,job) (" + v + ")"
-			}
-			res, _, err := v1api.Query(ctx, query, time.Now())
-			if err != nil {
-				fmt.Printf("%s\n", err.Error())
-				t3.IncrementWithError(1)
-				continue
-			}
-			mat := res.(model.Vector)
-			for _, m := range mat {
-				x, ok := nodes[Node{Job: string(m.Metric["job"]), Instance: string(m.Metric["instance"])}]
-				if !ok {
-					x = make([]Alert, 0)
-				}
-				nodes[Node{Job: string(m.Metric["job"]), Instance: string(m.Metric["instance"])}] = append(x, Alert{Name: r.Name, State: "present"})
-			}
+		selectors, err := analyzeMetricsFromQuery(r.Query)
+		if err != nil {
+			level.Warn(logger).Log("msg", "Can't analyze rule", "rule", r.Name, "err", err)
+			t3.IncrementWithError(1)
+			continue
+		}
+		if len(selectors) == 0 {
 			t3.Increment(1)
+			continue
 		}
 
+		parts := make([]string, 0, len(selectors))
+		for _, v := range selectors {
+			parts = append(parts, "group by (instance,job) ("+v+")")
+		}
+		query := strings.Join(parts, " and ")
+
+		qctx, qcancel := context.WithTimeout(context.Background(), 10*time.Second)
+		res, _, err := v1api.Query(qctx, query, time.Now())
+		qcancel()
+		if err != nil {
+			level.Warn(logger).Log("msg", "Query failed", "rule", r.Name, "err", err)
+			t3.IncrementWithError(1)
+			continue
+		}
+		vec, ok := res.(model.Vector)
+		if !ok {
+			level.Warn(logger).Log("msg", "Unexpected result type", "rule", r.Name, "type", res.Type().String())
+			t3.IncrementWithError(1)
+			continue
+		}
+		// Metrics exist on these nodes but the alert isn't active: report as OK.
+		for _, m := range vec {
+			l := model.LabelSet(m.Metric)
+			n := nodeOf(l)
+			if active[n] {
+				continue
+			}
+			lbl := labelsOf(targets[n], l)
+			lbl["alertname"] = r.Name
+			out = append(out, Entity{Name: n.Instance, Alert: r.Name, State: "present", Labels: lbl})
+		}
+		t3.Increment(1)
 	}
 
-	var data = make(map[string]map[string][]Alert, 0)
-
-	for nodeInfo, alerts := range nodes {
-		if _, ok := data[nodeInfo.Instance]; !ok {
-			data[nodeInfo.Instance] = make(map[string][]Alert, 0)
-		}
-		if _, ok := data[nodeInfo.Instance][nodeInfo.Job]; !ok {
-			data[nodeInfo.Instance][nodeInfo.Job] = make([]Alert, 0)
-		}
-		for _, a := range alerts {
-			if a.State == "present" {
-				continue
-			}
-			data[nodeInfo.Instance][nodeInfo.Job] = append(data[nodeInfo.Instance][nodeInfo.Job], a)
-		}
-		for _, a := range alerts {
-			var found bool
-			if a.State != "present" {
-				continue
-			}
-			for _, existingA := range data[nodeInfo.Instance][nodeInfo.Job] {
-				if existingA.Name == a.Name {
-					found = true
-					continue
-				}
-			}
-			if found {
-				continue
-			}
-			data[nodeInfo.Instance][nodeInfo.Job] = append(data[nodeInfo.Instance][nodeInfo.Job], a)
-		}
+	if out == nil {
+		out = []Entity{}
 	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Alert != out[j].Alert {
+			return out[i].Alert < out[j].Alert
+		}
+		return out[i].Name < out[j].Name
+	})
+	return out, nil
+}
 
+func writeReport(path string, data report) error {
 	t, err := template.New("").Parse(tmpl)
 	if err != nil {
-		fmt.Printf("error: %s", err.Error())
-		os.Exit(1)
+		return err
 	}
-	f, err := os.Create(*outputFile)
+	// Write to a temporary file and rename, so a concurrent reader never sees a partial file.
+	f, err := os.CreateTemp(filepath.Dir(path), ".alerts-*.html")
 	if err != nil {
-		fmt.Printf("error: %s", err.Error())
-		os.Exit(1)
+		return err
 	}
-	err = t.Execute(f, data)
-	if err != nil {
-		fmt.Printf("error: %s", err.Error())
-		os.Exit(1)
+	defer os.Remove(f.Name())
+	if err := t.Execute(f, data); err != nil {
+		f.Close()
+		return err
 	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if err := os.Chmod(f.Name(), 0o644); err != nil {
+		return err
+	}
+	return os.Rename(f.Name(), path)
 }
 
 func analyzeMetricsFromQuery(query string) ([]string, error) {
@@ -273,6 +408,6 @@ func extractMetricFromExpr(exp parser.Expr) ([]string, error) {
 		}
 		return m, nil
 	default:
-		return nil, fmt.Errorf("unkown expr: %v", x)
+		return nil, fmt.Errorf("unknown expr: %v", x)
 	}
 }
