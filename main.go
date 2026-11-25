@@ -44,10 +44,6 @@ var (
 		"web.listen-address",
 		"Address to listen on for the serve command",
 	).Default(":8080").String()
-	hideInactive = kingpin.Flag(
-		"hide.inactive",
-		"Hide hexagons for alerts that are not firing or pending",
-	).Bool()
 	groupByFlag = kingpin.Flag(
 		"group.by",
 		"Comma-separated list of labels to group hexagons by, outermost group first",
@@ -173,16 +169,6 @@ func generate(logger log.Logger, promClient api.Client, interval time.Duration, 
 	}
 	if err != nil {
 		return err
-	}
-
-	if *hideInactive {
-		active := entities[:0]
-		for _, e := range entities {
-			if e.State != "present" {
-				active = append(active, e)
-			}
-		}
-		entities = active
 	}
 
 	var groupBy []string

@@ -1,57 +1,371 @@
 <!doctype html>
 <html lang="en">
-  <head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>d</title>
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.2.0/dist/css/bootstrap.min.css" rel="stylesheet" integrity="sha384-gH2yIJqKdNHPEq0n4Mqa/HGKIhSkIHeL5AyhkYV8i59U5AR6csBvApHHNl/vI1Bx" crossorigin="anonymous">
- 
-<link rel="stylesheet" type="text/css" href="https://cdn.datatables.net/v/bs5/jq-3.6.0/dt-1.12.1/fh-3.2.4/r-2.3.0/datatables.min.css"/>
- 
-<script type="text/javascript" src="https://cdn.datatables.net/v/bs5/jq-3.6.0/dt-1.12.1/fh-3.2.4/r-2.3.0/datatables.min.js"></script>
-
-
-
-<script type="text/javascript">
-$(document).ready(function () {
-    $('#alerts').DataTable();
-});
-</script>
-
-  </head>
-  <body>
-<div class="container">
-    <h1>Prometheus alerts</h1>
-<table class="table" id="alerts">
-  <thead>
-    <tr>
-      <th scope="col">Instance</th>
-      <th scope="col">Job</th>
-      <th scope="col">Alert</th>
-      <th scope="col">Status</th>
-    </tr>
-  </thead>
-  <tbody>
-{{ range $instance, $ct := . }}
-{{ $first := true}}
-{{ range $job, $alerts := $ct }}
-{{ range $i, $alert := $alerts }}
-{{ if $first }}
-{{ $first = false}}
-{{ end }}
-    <tr class="table-{{if eq $alert.State "pending"}}warning{{end}}{{if eq $alert.State "present"}}success{{end}}{{if eq $alert.State "firing"}}danger{{end}}">
-      <td scope="col">{{$instance}}</td>
-      <td scope="col">{{$job}}</td>
-      <td scope="col">{{$alert.Name}}</td>
-      <td scope="col">{{if eq $alert.State "present"}}OK{{else}}{{$alert.State}}{{end}}</td>
-    </tr>
-  </thead>
-{{ end }}
-{{ end }}
-{{ end }}
-  </tbody>
-</table>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Prometheus alerts</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #fafafa; --fg: #222; --panel: #fff; --border: #ddd; --muted: #666; --faint: #888;
+    --hover: #000; --tip-border: #999; --shadow: rgba(0,0,0,.25);
+    /* Okabe-Ito palette: distinguishable under protanopia/deuteranopia/tritanopia */
+    --firing: #D55E00; --pending: #F0E442; --ok: #0072B2; --none: #adb5bd;
+    --firing-text: #B34700; --pending-text: #7A6E00; --ok-text: #0072B2;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #121417; --fg: #e6e6e6; --panel: #1b1e23; --border: #3a3f47; --muted: #aab0b8; --faint: #8b9199;
+      --hover: #fff; --tip-border: #6b727c; --shadow: rgba(0,0,0,.7);
+      --firing: #FF8A3D; --pending: #F0E442; --ok: #56B4E9; --none: #5c636d;
+      --firing-text: #FF8A3D; --pending-text: #F0E442; --ok-text: #56B4E9;
+    }
+  }
+  body { font-family: system-ui, sans-serif; margin: 0; padding: 1.5rem 2rem; background: var(--bg); color: var(--fg); }
+  .legend span { display: inline-block; margin-right: 1rem; }
+  .legend i { display: inline-block; width: 12px; height: 12px; margin-right: 4px; vertical-align: middle; }
+  #root { width: 100%; }
+  .groups { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 1rem; }
+  .group { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: .5rem .75rem .75rem; box-sizing: border-box; }
+  .group > .groups { margin-top: .25rem; }
+  .group > h2, .group > h3, .group > h4 { margin: .4rem 0; font-size: 1rem; }
+  .group > h2 { font-size: 1.25rem; }
+  .group > h3 { font-size: 1.1rem; }
+  .overview h2 { margin: .25rem 0; }
+  .crumbs { margin: .75rem 0; font-size: 14px; }
+  .group-name a.drill { color: inherit; text-decoration: none; }
+  .group-name a.drill:hover { text-decoration: underline; }
+  table.detail { border-collapse: collapse; margin-top: 1rem; font-size: 13px; background: var(--panel); }
+  table.detail th, table.detail td { border: 1px solid var(--border); padding: .3rem .6rem; text-align: left; }
+  .group-name small { color: var(--faint); font-weight: normal; }
+  svg polygon { stroke: var(--bg); stroke-width: 1; cursor: pointer; }
+  svg polygon:hover { stroke: var(--hover); stroke-width: 2; }
+  .firing { fill: var(--firing); } .pending { fill: var(--pending); } .ok { fill: var(--ok); } .none { fill: var(--none); }
+  #tip { position: fixed; display: none; pointer-events: none; background: var(--panel); color: var(--fg); border: 1px solid var(--tip-border);
+         border-radius: 4px; padding: .5rem .75rem; box-shadow: 0 2px 8px var(--shadow); font-size: 13px; max-width: 420px; z-index: 10; }
+  #tip h4 { margin: 0 0 .3rem; }
+  #tip .lbl { color: var(--muted); margin-bottom: .3rem; }
+  #tip ul { margin: 0; padding: 0; list-style: none; }
+  #tip li::before { content: ""; display: inline-block; width: 9px; height: 9px; margin-right: 6px; border-radius: 50%; background: var(--c); }
+</style>
+</head>
+<body>
+<h1>Prometheus alerts</h1>
+<div style="color:var(--faint);font-size:12px">Generated {{.Generated}}{{if gt .RefreshSeconds 0}} · reloads every {{.RefreshSeconds}}s{{end}}</div>
+<div class="legend">
+  <span><i style="background:var(--firing)"></i>firing</span>
+  <span><i style="background:var(--pending)"></i>pending</span>
+  <span><i style="background:var(--ok)"></i>OK</span>
 </div>
-    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.2.0/dist/js/bootstrap.bundle.min.js" integrity="sha384-A3rJD856KowSb7dwlZdYEkO39Gagi7vIsF0jrRAoQmDKKtQBHUuLZ9AsSv4jD4Xa" crossorigin="anonymous"></script>
-  </body>
+<div id="root"></div>
+<div id="tip"></div>
+<script>
+const data = {{.}};
+const R = 16;                       // hexagon circumradius
+const W = Math.sqrt(3) * R;         // hexagon width (pointy-top)
+const COLORS = { firing: 'var(--firing)', pending: 'var(--pending)', present: 'var(--ok)' };
+const TEXT_COLORS = { firing: 'var(--firing-text)', pending: 'var(--pending-text)', present: 'var(--ok-text)' };
+
+function status(e) {
+  if (e.state === 'firing') return 'firing';
+  if (e.state === 'pending') return 'pending';
+  return 'ok';
+}
+const RANK = { firing: 3, pending: 2, ok: 1, none: 0 };
+
+// Collapses entities into a single hexagon showing the worst state among them.
+function aggregate(key, value, items) {
+  const worst = items.map(status).sort((a, b) => RANK[b] - RANK[a])[0];
+  return {
+    aggregate: true, key, name: value, items,
+    state: worst === 'ok' ? 'present' : worst,
+    counts: { firing: items.filter(e => e.state === 'firing').length,
+              pending: items.filter(e => e.state === 'pending').length,
+              present: items.filter(e => e.state === 'present').length },
+  };
+}
+
+// With a single group-by label, every entity is a hexagon. With several, the
+// innermost label is aggregated: one hexagon per value, showing the worst state.
+function group(entities, keys) {
+  if (keys.length === 0) return entities;
+  if (keys.length === 1 && data.groupBy.length > 1) {
+    const m = new Map();
+    for (const e of entities) {
+      const v = e.labels[keys[0]] ?? '(none)';
+      if (!m.has(v)) m.set(v, []);
+      m.get(v).push(e);
+    }
+    return [...m.entries()].map(([v, items]) => aggregate(keys[0], v, items));
+  }
+  const m = new Map();
+  for (const e of entities) {
+    const v = e.labels[keys[0]] ?? '(none)';
+    if (!m.has(v)) m.set(v, []);
+    m.get(v).push(e);
+  }
+  // Worst groups first: firing, then pending, then all green; ties by number of
+  // hexagons in that state, then by name.
+  const worst = items => Math.max(...items.map(e => RANK[status(e)]));
+  const count = (items, r) => items.filter(e => RANK[status(e)] === r).length;
+  return [...m.entries()]
+    .sort(([an, ai], [bn, bi]) => {
+      const aw = worst(ai), bw = worst(bi);
+      return bw - aw || count(bi, bw) - count(ai, aw) || an.localeCompare(bn);
+    })
+    .map(([name, items]) => ({ name, items, children: group(items, keys.slice(1)) }));
+}
+
+function hexPoints(cx, cy) {
+  const p = [];
+  for (let i = 0; i < 6; i++) {
+    const a = Math.PI / 180 * (60 * i - 30);
+    p.push((cx + R * Math.cos(a)).toFixed(2) + ',' + (cy + R * Math.sin(a)).toFixed(2));
+  }
+  return p.join(' ');
+}
+
+// Honeycomb: rows of `cols` hexagons, odd rows offset by half a hexagon so they touch.
+// A path entry that opens the overview of a single instance.
+function overviewOf(e) {
+  return { overview: true, instance: e.name, job: e.labels.job };
+}
+
+const tip = document.getElementById('tip');
+
+function showTip(ev, e) {
+  tip.innerHTML = '';
+  const h = document.createElement('h4');
+  h.textContent = e.name || '(no instance)';
+  tip.appendChild(h);
+  const label = s => s === 'present' ? 'OK' : s;
+  const items = e.aggregate ? e.items : data.entities.filter(x =>
+    x.name === e.name && x.labels.job === e.labels.job);
+  const lbl = document.createElement('div');
+  lbl.className = 'lbl';
+  if (e.aggregate) {
+    lbl.textContent = e.counts.firing + ' firing, ' + e.counts.pending + ' pending, ' + e.counts.present + ' OK';
+  } else {
+    lbl.textContent = Object.entries(e.labels)
+      .filter(([k]) => k !== 'alertname').map(([k, v]) => k + '=' + v).join(', ');
+  }
+  tip.appendChild(lbl);
+  const ul = document.createElement('ul');
+  const sorted = [...items].sort((a, b) =>
+    RANK[status(b)] - RANK[status(a)] || (a.alert || a.name).localeCompare(b.alert || b.name));
+  for (const x of sorted.slice(0, 15)) {
+    const li = document.createElement('li');
+    li.style.setProperty('--c', COLORS[x.state] || 'var(--none)');
+    li.textContent = (x.alert || x.name) + ' \u2014 ' + label(x.state);
+    ul.appendChild(li);
+  }
+  if (sorted.length > 15) {
+    const li = document.createElement('li');
+    li.textContent = '\u2026 and ' + (sorted.length - 15) + ' more';
+    ul.appendChild(li);
+  }
+  tip.appendChild(ul);
+  tip.style.display = 'block';
+  const pad = 14;
+  let x = ev.clientX + pad, y = ev.clientY + pad;
+  if (x + tip.offsetWidth > window.innerWidth) x = ev.clientX - tip.offsetWidth - pad;
+  if (y + tip.offsetHeight > window.innerHeight) y = ev.clientY - tip.offsetHeight - pad;
+  tip.style.left = Math.max(0, x) + 'px';
+  tip.style.top = Math.max(0, y) + 'px';
+}
+
+function honeycomb(entities, chain) {
+  const sorted = [...entities].sort((a, b) =>
+    RANK[status(b)] - RANK[status(a)] || a.name.localeCompare(b.name));
+  const maxCols = Math.max(1, Math.floor((window.innerWidth - 160) / W));
+  const cols = Math.min(maxCols, Math.max(1, Math.ceil(Math.sqrt(sorted.length * 1.5))));
+  const rows = Math.ceil(sorted.length / cols);
+  const ns = 'http://www.w3.org/2000/svg';
+  const svg = document.createElementNS(ns, 'svg');
+  svg.setAttribute('width', cols * W + W / 2 + 2);
+  svg.setAttribute('height', (rows - 1) * 1.5 * R + 2 * R + 2);
+  sorted.forEach((e, i) => {
+    const r = Math.floor(i / cols), c = i % cols;
+    const cx = W / 2 + 1 + c * W + (r % 2 ? W / 2 : 0);
+    const cy = R + 1 + r * 1.5 * R;
+    const poly = document.createElementNS(ns, 'polygon');
+    poly.setAttribute('points', hexPoints(cx, cy));
+    poly.setAttribute('class', status(e));
+    poly.addEventListener('mousemove', ev => showTip(ev, e));
+    poly.addEventListener('mouseleave', () => tip.style.display = 'none');
+    poly.style.cursor = 'pointer';
+    if (e.aggregate) {
+      poly.addEventListener('click', () => go(chain.concat([{ key: e.key, value: e.name }])));
+    } else {
+      poly.addEventListener('click', () => go(chain.concat([overviewOf(e)])));
+    }
+    svg.appendChild(poly);
+  });
+  return svg;
+}
+
+// Drill-down state lives in the URL hash so it survives the auto reload.
+// It is a list of {key, value} filters, in group-by order.
+function readPath() {
+  try { return JSON.parse(decodeURIComponent(location.hash.slice(1))) || []; } catch (e) { return []; }
+}
+function go(path) {
+  tip.style.display = 'none';
+  location.hash = path.length ? encodeURIComponent(JSON.stringify(path)) : '';
+  if (!path.length) history.replaceState(null, '', location.pathname + location.search);
+  draw();
+}
+
+function render(nodes, depth, parent, chain, base) {
+  if (!Array.isArray(nodes) || nodes.length === 0 || nodes[0].children === undefined) {
+    parent.appendChild(honeycomb(nodes, chain));
+    return;
+  }
+  const wrap = document.createElement('div');
+  wrap.className = 'groups';
+  parent.appendChild(wrap);
+  for (const g of nodes) {
+    const div = document.createElement('div');
+    div.className = 'group';
+    const key = data.groupBy[base + depth];
+    const h = document.createElement('h' + Math.min(2 + depth, 4));
+    h.className = 'group-name';
+    const count = g.items.length;
+    const worst = g.items.map(status).sort((a, b) => RANK[b] - RANK[a])[0];
+    const link = document.createElement('a');
+    link.href = '#';
+    link.className = 'drill';
+    link.textContent = key + ': ' + g.name;
+    const here = chain.concat([{ key, value: g.name }]);
+    link.addEventListener('click', ev => { ev.preventDefault(); go(here); });
+    h.appendChild(link);
+    const s = document.createElement('small');
+    s.textContent = ' (' + count + ', ' + worst + ')';
+    h.appendChild(s);
+    div.appendChild(h);
+    render(g.children, depth + 1, div, here, base);
+    wrap.appendChild(div);
+  }
+}
+
+function breadcrumb(path) {
+  const nav = document.createElement('div');
+  nav.className = 'crumbs';
+  const add = (label, target) => {
+    if (nav.childNodes.length) nav.append(' \u203a ');
+    if (target === null) { nav.append(label); return; }
+    const a = document.createElement('a');
+    a.href = '#';
+    a.textContent = label;
+    a.addEventListener('click', ev => { ev.preventDefault(); go(target); });
+    nav.appendChild(a);
+  };
+  add('All', path.length ? [] : null);
+  path.forEach((p, i) => add(p.overview ? 'instance: ' + p.instance : p.key + ': ' + p.value, i === path.length - 1 ? null : path.slice(0, i + 1)));
+  return nav;
+}
+
+// Individual alert/instance details, shown once every group-by label is drilled into.
+function table(entities, linkBase) {
+  const tbl = document.createElement('table');
+  tbl.className = 'detail';
+  const head = tbl.createTHead().insertRow();
+  for (const c of ['State', 'Alert', 'Instance', 'Labels']) {
+    const th = document.createElement('th');
+    th.textContent = c;
+    head.appendChild(th);
+  }
+  const body = tbl.createTBody();
+  const sorted = [...entities].sort((a, b) =>
+    RANK[status(b)] - RANK[status(a)] || a.alert.localeCompare(b.alert) || a.name.localeCompare(b.name));
+  for (const e of sorted) {
+    const r = body.insertRow();
+    const st = r.insertCell();
+    st.textContent = e.state === 'present' ? 'OK' : e.state;
+    st.style.cssText = 'font-weight:bold;color:' + (TEXT_COLORS[e.state] || 'var(--muted)');
+    r.insertCell().textContent = e.alert;
+    const ic = r.insertCell();
+    if (linkBase) {
+      const a = document.createElement('a');
+      a.href = '#';
+      a.textContent = e.name;
+      a.addEventListener('click', ev => { ev.preventDefault(); go(linkBase.concat([overviewOf(e)])); });
+      ic.appendChild(a);
+    } else {
+      ic.textContent = e.name;
+    }
+    r.insertCell().textContent = Object.entries(e.labels)
+      .filter(([k]) => k !== 'instance' && k !== 'alertname').map(([k, v]) => k + '=' + v).join(', ');
+  }
+  return tbl;
+}
+
+// Overview of one instance: its labels and every alert rule evaluated on it.
+function overview(path, o) {
+  const entities = data.entities.filter(e =>
+    e.name === o.instance && (o.job === undefined || e.labels.job === o.job));
+  const div = document.createElement('div');
+  div.className = 'overview';
+  const h = document.createElement('h2');
+  h.textContent = o.instance || '(no instance)';
+  div.appendChild(h);
+
+  // Labels shared by every alert on this instance (the target labels).
+  const common = {};
+  if (entities.length) {
+    for (const [k, v] of Object.entries(entities[0].labels)) {
+      if (k !== 'alertname' && entities.every(e => e.labels[k] === v)) common[k] = v;
+    }
+  }
+  const lbl = document.createElement('div');
+  lbl.className = 'lbl';
+  lbl.textContent = Object.entries(common).map(([k, v]) => k + '=' + v).join(', ');
+  div.appendChild(lbl);
+
+  const count = s => entities.filter(e => e.state === s).length;
+  const sum = document.createElement('p');
+  const worst = entities.map(status).sort((a, b) => RANK[b] - RANK[a])[0] || 'none';
+  sum.innerHTML = '';
+  const st = document.createElement('strong');
+  st.textContent = worst === 'ok' ? 'OK' : worst === 'none' ? 'No alerts' : worst;
+  st.style.color = TEXT_COLORS[worst === 'ok' ? 'present' : worst] || 'var(--muted)';
+  sum.append(st, ' \u2014 ' + count('firing') + ' firing, ' + count('pending') + ' pending, ' + count('present') + ' OK');
+  div.appendChild(sum);
+
+  div.appendChild(honeycomb(entities, path));
+  div.appendChild(table(entities, null));
+  return div;
+}
+
+function draw() {
+  const fullPath = readPath();
+  const root = document.getElementById('root');
+  root.innerHTML = '';
+  root.appendChild(breadcrumb(fullPath));
+  const last = fullPath[fullPath.length - 1];
+  if (last && last.overview) {
+    root.appendChild(overview(fullPath.slice(0, -1), last));
+    return;
+  }
+  const path = fullPath;
+  const entities = data.entities.filter(e => path.every(p => (e.labels[p.key] ?? '(none)') === p.value));
+  const keys = data.groupBy.slice(path.length);
+  if (keys.length === 0) {
+    root.appendChild(honeycomb(entities, path));
+    root.appendChild(table(entities, path));
+    return;
+  }
+  render(group(entities, keys), 0, root, path, path.length);
+}
+
+window.addEventListener('hashchange', draw);
+draw();
+
+// location.reload() keeps the URL hash (a meta refresh drops it), so the
+// drill-down position survives the reload.
+if (data.refreshSeconds > 0) {
+  setTimeout(() => location.reload(), data.refreshSeconds * 1000);
+}
+</script>
+</body>
 </html>
