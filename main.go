@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/alecthomas/kingpin/v2"
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/jedib0t/go-pretty/v6/progress"
@@ -21,7 +22,6 @@ import (
 	v1 "github.com/prometheus/client_golang/api/prometheus/v1"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/promql/parser"
-	kingpin "gopkg.in/alecthomas/kingpin.v2"
 )
 
 var (

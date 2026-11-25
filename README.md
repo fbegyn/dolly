@@ -15,7 +15,7 @@ The page uses a colour-blind-friendly palette and supports light and dark mode.
 
 ## Requirements
 
-- Go 1.18+
+- Go 1.26+
 - A reachable Prometheus server
 
 ## Build
