@@ -1,0 +1,53 @@
+# Make sure to check the documentation at https://goreleaser.com
+---
+version: 2
+before:
+  hooks:
+    - go mod tidy
+    - go generate ./...
+builds:
+  - env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    main: .
+    flags:
+      - "-trimpath"
+    ldflags:
+      - "-w -s"
+      - "-X github.com/prometheus/common/version.Branch={{ .Branch }}"
+      - "-X github.com/prometheus/common/version.Revision={{ .Commit }}"
+      - "-X github.com/prometheus/common/version.Version={{ .Tag }}"
+      - "-X github.com/prometheus/common/version.BuildDate={{ .Date }}"
+archives:
+  - id: arch
+    formats: ["tar.gz", "zip", "binary"]
+release:
+  prerelease: auto
+checksum:
+  name_template: 'checksums.txt'
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'
+nfpms:
+  - package_name: "dolly"
+    section: "default"
+    priority: "extra"
+    maintainer: "Francis Begyn <francis@begyn.be>"
+    description: |
+      dolly is a Prometheus alerts dashboard generator.
+    homepage: "https://github.com/fbegyn/dolly"
+    license: "Apache-2.0"
+    bindir: /usr/local/bin
+    formats:
+      - apk
+      - deb
+      - rpm
